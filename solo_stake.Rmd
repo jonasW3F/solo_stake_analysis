@@ -1,0 +1,357 @@
+---
+title: "Analysis on solo-stake"
+author: "Jonas Gehrlein"
+date: "2/17/2021"
+output: html_document
+---
+
+```{r}
+# Specify if code should be shown in export
+show_code = FALSE 
+# Specify which network you would like to analyze. Must be "polkadot" or "kusama".
+chain = "polkadot"
+# Specify which session you would like to analyze. Must be >= 419 for Polkadot and >= 5994 for KSM.
+session = 1599
+```
+
+```{r, echo=FALSE}
+#Setting up the denomination KSM and (new) DOT:
+network_identifier = ifelse(chain == "polkadot", "DOT", "KSM")
+if(chain=="polkadot"){
+  normalization = 1/10000000000
+} else {
+  normalization = 1/1000000000000
+}
+```
+
+```{r setup, fig.width=4, fig.height=3, warning=FALSE, message=FALSE, echo=FALSE}
+#Load the required R packages:
+library(plyr)
+library(dplyr)
+library(rmarkdown)
+library(ggplot2)
+library(tidyverse)
+library(dbplyr)
+library(igraph)
+library(network)
+library(tidygraph)
+library(ggraph)
+library(splitstackshape)
+library(visNetwork)
+library(networkD3)
+library(htmlwidgets)
+library(REAT)
+```
+
+
+```{r, echo=FALSE}
+#Import the data into the data-frames:
+nominators <- read.csv(url(paste("https://storage.googleapis.com/watcher-csv-exporter/", chain , "_nominators_session_", session, ".csv", sep=(""))))
+validators <- read.csv(url(paste("https://storage.googleapis.com/watcher-csv-exporter/", chain , "_validators_session_", session, ".csv", sep=(""))))
+```
+
+
+```{r, echo=FALSE}
+# Preparation
+solo_stake_nominators <- subset(nominators, num_targets==1,
+                  select=c(bonded_amount,targets))
+
+solo_stake_nominators <- subset(solo_stake_nominators, select=c(bonded_amount, targets))
+
+collapse <- solo_stake_nominators %>%
+  group_by(targets) %>%
+  summarize(solo_stake_sum = sum(bonded_amount))
+
+collapse$ID = collapse$targets
+validators$ID = validators$stash_address
+
+merged <- merge(collapse, validators, by="ID", all.y=TRUE)
+merged$solo_stake_sum <- ifelse(is.na(merged$solo_stake_sum), 0 , merged$solo_stake_sum)
+
+validators_with_solo_stake = subset(merged, select=c(solo_stake_sum, name, stash_address, commission_percent, self_stake, total_stake))
+
+# Adding the short identity
+validators_with_solo_stake$has_identity = ifelse(validators_with_solo_stake$name == "",0,1)
+
+# Only parse the first 4 characters of the identity string. Fortunately, validators follow a naming pattern where the first few characters are identical.
+validators_with_solo_stake$short_identity = substr(validators_with_solo_stake$name, start = 1, stop = 4)
+
+# Replace empty name with indicator that validator is pseudo-anonymous
+validators_with_solo_stake$short_identity = ifelse(validators_with_solo_stake$short_identity == "","pseudo-a.",validators_with_solo_stake$short_identity)
+
+tmp <- validators_with_solo_stake %>% 
+    count(short_identity)
+validators_with_solo_stake <- merge(validators_with_solo_stake,tmp, by="short_identity", all.x = TRUE)
+
+# normalize all planck values to DOT/KSM
+validators_with_solo_stake$solo_stake_sum = validators_with_solo_stake$solo_stake_sum * normalization
+validators_with_solo_stake$self_stake = validators_with_solo_stake$self_stake * normalization
+validators_with_solo_stake$total_stake = validators_with_solo_stake$total_stake * normalization
+nominators$bonded_amount = nominators$bonded_amount * normalization
+solo_stake_nominators$bonded_amount = solo_stake_nominators$bonded_amount*normalization
+```
+# Summary
+In the following, several perspectives on solo-stake are taken. The main focus is on larger validator operators which impose the risk of spinning up node after node, transferring their self-stake away and imposing a nothing-at-stake risk. The fourth analysis (Solostake #4) indicates that some of the candidates for such an attack (i.e., many nodes, little commission and little self-stake) do have significant number of solo-stake and imposing a minimum might not work so much on them.  
+
+# Distribution of solo-stake for each validator
+Specifications: All individual nodes
+
+This graph plots the sum of solo-stake for **every** validator currently in the network.
+
+```{r, echo=FALSE}
+solo_stake_sum = validators_with_solo_stake$solo_stake_sum
+df_graph = as.data.frame(solo_stake_sum)
+df_graph$validators = 1:nrow(df_graph)
+df_graph$solo_stake_sum = sort(df_graph$solo_stake_sum, decreasing=FALSE)
+ggplot(data=df_graph, aes(x=validators, y=solo_stake_sum))+ geom_bar(stat="identity")
+``` 
+
+# Solo-stake #1
+Specifications: Grouped by operators - No pseudoanonymous nodes, operator-size > 4 nodes.
+
+```{r, echo=FALSE}
+# Collapse the data based on the short_identity taking the mean of self_stake and commission and the sum of solo_stake
+# Super annoying, I want to take the mean and the sum of the solo_stake_sum therefore I first have to duplicate it.
+validators_with_solo_stake$solo_stake_mean = validators_with_solo_stake$solo_stake_sum
+
+df_table = merge(
+      aggregate(cbind(solo_stake_sum) ~ short_identity, validators_with_solo_stake, sum), 
+      aggregate(cbind(self_stake, commission_percent, n, solo_stake_mean) ~ short_identity, validators_with_solo_stake, mean)
+            )
+df_table$fraction <- round(df_table$n / sum(df_table$n),digits=3)
+
+df_table = df_table %>% 
+  rename(
+    number_nodes = n,
+    self_stake_mean = self_stake,
+    commission_percent_mean = commission_percent
+    )
+
+# Order by number of nodes
+df_table <- df_table[order(-df_table$number_nodes),]
+rownames(df_table) <- NULL
+# Table Output
+knitr::kable(df_table, format="simple", format.args = list(scientific = FALSE))
+
+#  Graph Output
+df_graph = df_table$solo_stake_sum
+df_graph = as.data.frame(df_graph)
+
+df_graph = df_graph %>% 
+  rename(
+    solo_stake_sum = df_graph
+    )
+df_graph$validators = 1:nrow(df_graph)
+df_graph$solo_stake_sum = sort(df_graph$solo_stake_sum, decreasing=FALSE)
+ggplot(data=df_graph, aes(x=validators, y=solo_stake_sum))+ geom_bar(stat="identity")
+```
+
+# Solo-stake #2
+Specifications: Individual nodes conditional on operators - No pseudoanonymous nodes, operator-size > 4 nodes.
+
+```{r, echo=FALSE}
+df_table = subset(validators_with_solo_stake, n > 4 & short_identity != "pseudo-a.")
+df_table = subset(df_table, select=c(n, name, solo_stake_sum, self_stake, commission_percent))
+
+# Order by number of nodes
+df_table <- df_table[order(-df_table$n),]
+rownames(df_table) <- NULL
+
+# Table Output
+knitr::kable(df_table, format="simple", format.args = list(scientific = FALSE))
+
+# Graph Output
+df_graph = df_table$solo_stake_sum
+df_graph = as.data.frame(df_graph)
+
+df_graph = df_graph %>% 
+  rename(
+    solo_stake_sum = df_graph
+    )
+df_graph$validators = 1:nrow(df_graph)
+df_graph$solo_stake_sum = sort(df_graph$solo_stake_sum, decreasing=FALSE)
+ggplot(data=df_graph, aes(x=validators, y=solo_stake_sum))+ geom_bar(stat="identity")
+``` 
+
+# Solo-stake #3
+Specifications: Individual nodes conditional on operators - No pseudoanonymous nodes, operator-size > 4 nodes, commission_percent < 100%.
+
+```{r, echo=FALSE}
+df_table = subset(validators_with_solo_stake, n > 4 & short_identity != "pseudo-a." & commission_percent < 100)
+df_table = subset(df_table, select=c(n, name, solo_stake_sum, self_stake, commission_percent))
+
+# Order by number of nodes
+df_table <- df_table[order(-df_table$n),]
+rownames(df_table) <- NULL
+
+# Table Output
+knitr::kable(df_table, format="simple", format.args = list(scientific = FALSE))
+
+# Graph Output
+df_graph = df_table$solo_stake_sum
+df_graph = as.data.frame(df_graph)
+
+df_graph = df_graph %>% 
+  rename(
+    solo_stake_sum = df_graph
+    )
+df_graph$validators = 1:nrow(df_graph)
+df_graph$solo_stake_sum = sort(df_graph$solo_stake_sum, decreasing=FALSE)
+ggplot(data=df_graph, aes(x=validators, y=solo_stake_sum))+ geom_bar(stat="identity")
+```
+
+# Solo-stake #4
+Specifications: Individual nodes conditional on operators - No pseudoanonymous nodes, operator-size > 4 nodes, commission_percent < 3%.
+
+```{r, echo=FALSE}
+df_table = subset(validators_with_solo_stake, n > 4 & short_identity != "pseudo-a." & commission_percent < 3)
+df_table = subset(df_table, select=c(n, name, solo_stake_sum, self_stake, commission_percent))
+
+# Order by number of nodes
+df_table <- df_table[order(-df_table$n),]
+rownames(df_table) <- NULL
+
+# Table Output
+knitr::kable(df_table, format="simple", format.args = list(scientific = FALSE))
+
+# Graph Output
+df_graph = df_table$solo_stake_sum
+df_graph = as.data.frame(df_graph)
+
+df_graph = df_graph %>% 
+  rename(
+    solo_stake_sum = df_graph
+    )
+df_graph$validators = 1:nrow(df_graph)
+df_graph$solo_stake_sum = sort(df_graph$solo_stake_sum, decreasing=FALSE)
+ggplot(data=df_graph, aes(x=validators, y=solo_stake_sum))+ geom_bar(stat="identity")
+```
+
+# Flowchart of Solo-stake
+```{r, echo=FALSE}
+# Sankey Network of Bondflow
+# Define quantiles of bonded_amount to group nominators into those groups
+nominators_sankey = subset.data.frame(nominators, num_targets == 1)
+quantiles = quantile(nominators_sankey$bonded_amount, c(.10, .20, .30, .40, .50, .60, .70, .80, .90, .95, .98)) 
+
+# Check in which quantile each nominator is
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount <= quantiles[1], " poorest 10%", "")
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[1] & nominators_sankey$bonded_amount <= quantiles[2], " between 10-20%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[2] & nominators_sankey$bonded_amount <= quantiles[3], " between 20-30%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[3] & nominators_sankey$bonded_amount <= quantiles[4], " between 30-40%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[4] & nominators_sankey$bonded_amount <= quantiles[5], " between 40-50%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[5] & nominators_sankey$bonded_amount <= quantiles[6], " between 50-60%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[6] & nominators_sankey$bonded_amount <= quantiles[7], " between 60-70%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[7] & nominators_sankey$bonded_amount <= quantiles[8], " between 70-80%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[8] & nominators_sankey$bonded_amount <= quantiles[9], " between 80-90%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[9] & nominators_sankey$bonded_amount <= quantiles[10], " between 90-95%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[10] & nominators_sankey$bonded_amount <= quantiles[11], " between 95-98%", nominators_sankey$quantiles)
+nominators_sankey$quantiles = ifelse(nominators_sankey$bonded_amount > quantiles[11], " richest 2%", nominators_sankey$quantiles)
+
+#nominators = subset(nominators, quantiles != " richest 2%") # if we want to exclude the richest 2%
+#validators = subset(validators, validators$commission_percent<100) # if we want to exclude the 100% validators
+
+x=cSplit(nominators_sankey, c("targets"), ",", direction = "long")
+
+y = as.data.frame(cbind(name = paste(validators$name), targets = paste(validators$stash_address)))
+
+x <- merge(x, y, by="targets")
+
+x$Weight = x$bonded_amount
+x$Weight = as.numeric(x$Weight)
+# Check if validator has identity
+x$has_identity = ifelse(x$name == "",0,1)
+
+# Only parse the first 4 characters of the identity string. Fortunately, validators follow a naming pattern where the first few characters are identical.
+x$short_identity = substr(x$name, start = 1, stop = 4)
+
+# Replace empty name with indicator that validator is pseudo-anonymous
+x$short_identity = ifelse(x$short_identity == "","pseudo-a.",x$short_identity)
+
+# Use newly generated identities (operators and pseudo-anonymous validators) as new destination indicator in network
+x$Destination = x$short_identity
+
+# Create the network as tibble object
+network <- tibble(x)
+
+network$Source = network$quantiles
+
+# Cast objects to character type
+network$Source = as.character(network$Source)
+network$Destination = as.character(network$Destination)
+
+# Generate sources data frame
+sources <- network %>%
+  distinct(Source) %>%
+  dplyr::rename(label = Source)
+
+# Generate destinations data frame
+destinations <- network %>%
+  distinct(Destination) %>%
+  dplyr::rename(label = Destination)
+
+# Create nodes 
+nodes <- full_join(sources, destinations, by = "label")
+nodes <- nodes %>% rowid_to_column("id")
+
+# Create routes
+per_route <- network %>%  
+  group_by(Source, Destination) %>%
+  ungroup()
+
+# Create edges
+edges <- per_route %>% 
+  left_join(nodes, by = c("Source" = "label")) %>% 
+  dplyr::rename(from = id)
+
+edges <- edges %>% 
+  left_join(nodes, by = c("Destination" = "label")) %>% 
+  dplyr::rename(to = id)
+
+edges <- select(edges, from, to, Weight)
+
+nodes_d3 <- as.data.frame(mutate(nodes, id = id - 1))
+edges_d3 <- as.data.frame(mutate(edges, from = from - 1, to = to - 1))
+
+# Make sankeyNetwork object
+sankey <- sankeyNetwork(Links = edges_d3, Nodes = nodes_d3, Source = "from", Target = "to", 
+                        NodeID = "label", Value = "Weight", fontSize = 16, unit = "Bond", height=1300, width=1000, nodeWidth=80, iterations=50, margin=list("left"=100, "right"=100))
+
+## Changes color to green
+sankey_rendered <- htmlwidgets::onRender(sankey,
+                                         'function(el, x) {
+    d3.selectAll(".node text")
+        .style("fill", "black");
+  }'
+)
+
+## Changes the position of the leaf-nodes to right
+sankey_rendered <- htmlwidgets::onRender(
+  sankey_rendered,
+  '
+function(el,x){
+  var node_text = d3.select(el)
+    .selectAll(".node text")
+    .attr("x", 6 + x.options.nodeWidth)
+    .attr("text-anchor", "start");
+}
+'
+)
+## Change position of the parent nodes (starting with a space) to the left
+
+sankey_rendered <- htmlwidgets::onRender(
+  sankey_rendered,
+  '
+  function(el,x){
+  // select all our node text
+  d3.select(el)
+  .selectAll(".node text")
+  .filter(function(d) { return d.name.startsWith(" "); })
+  .attr("x", x.options.nodeWidth - 16)
+  .attr("text-anchor", "end");
+  }
+  '
+)
+sankey_rendered
+``` 
+
